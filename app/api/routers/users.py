@@ -15,7 +15,12 @@ from app.schemas import AdminUserCreate, AdminUserUpdate, UserResponse
 router = APIRouter(prefix="/admin/users", tags=["users"])
 
 
-@router.get("/", response_model=list[UserResponse])
+@router.get(
+    "/",
+    response_model=list[UserResponse],
+    summary="List users (admin)",
+    description="All users. Admin only.",
+)
 def list_users(
     session: Session = Depends(get_session),
     _: User = Depends(require_admin),
@@ -24,7 +29,13 @@ def list_users(
     return list(users)
 
 
-@router.post("/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create user (admin)",
+    description="Create user with role. Admin only.",
+)
 def create_user(
     body: AdminUserCreate,
     session: Session = Depends(get_session),
@@ -49,7 +60,12 @@ def create_user(
     return user
 
 
-@router.patch("/{user_id}", response_model=UserResponse)
+@router.patch(
+    "/{user_id}",
+    response_model=UserResponse,
+    summary="Update user (admin)",
+    description="Update name, role, password. Admin only.",
+)
 def update_user(
     user_id: UUID,
     body: AdminUserUpdate,
@@ -81,7 +97,11 @@ def update_user(
 
 
 @router.delete(
-    "/{user_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response
+    "/{user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    summary="Delete user (admin)",
+    description="Cannot delete own user. Admin only.",
 )
 def delete_user(
     user_id: UUID,

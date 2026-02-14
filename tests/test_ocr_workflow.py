@@ -150,3 +150,71 @@ def test_cancel_terminal_job_rejected(client, current_user):
     _, _, completed, _ = _seed_doc_and_jobs(current_user)
     res = client.post(f"/ocr/jobs/{completed.id}/cancel")
     assert res.status_code == 400
+
+
+def test_run_easyocr_enqueues_pending_job(client, current_user):
+    with Session(engine) as session:
+        doc = Document(
+            user_id=current_user.id,
+            name="invoice-b",
+            type="invoice",
+            status="pending",
+            file_path="docs/b.pdf",
+            file_size=200,
+            mime_type="application/pdf",
+            pages=1,
+            confidence=None,
+            scanned_at=None,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        session.add(doc)
+        session.commit()
+        session.refresh(doc)
+
+    res = client.post(f"/ocr/run/easyocr/{doc.id}")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["provider"] == "easyocr"
+    assert body["status"] in {"pending", "running"}
+
+    with Session(engine) as session:
+        db_doc = session.exec(select(Document).where(Document.id == doc.id)).first()
+        assert db_doc is not None
+        assert db_doc.status == "processing"
+
+
+def test_ocr_ops_queue_stats_endpoint(client):
+    res = client.get("/ocr/ops/queue/stats")
+    assert res.status_code == 200
+    body = res.json()
+    assert set(body.keys()) == {"queue_depth", "delayed_depth", "dlq_depth"}
+
+
+def test_ocr_ops_dlq_endpoints(client):
+    list_res = client.get("/ocr/ops/dlq?limit=10")
+    assert list_res.status_code == 200
+    assert isinstance(list_res.json(), list)
+
+    history_res = client.get("/ocr/ops/requeue-history?limit=10")
+    assert history_res.status_code == 200
+    assert isinstance(history_res.json(), list)
+
+    requeue_res = client.post(
+        "/ocr/ops/dlq/requeue/00000000-0000-0000-0000-000000000000"
+    )
+    assert requeue_res.status_code == 200
+    body = requeue_res.json()
+    assert body["ok"] is False
+
+    purge_one = client.delete(
+        "/ocr/ops/dlq/00000000-0000-0000-0000-000000000000"
+    )
+    assert purge_one.status_code == 200
+    purge_one_body = purge_one.json()
+    assert purge_one_body["ok"] is False
+
+    purge_all = client.delete("/ocr/ops/dlq")
+    assert purge_all.status_code == 200
+    purge_all_body = purge_all.json()
+    assert purge_all_body["ok"] is True

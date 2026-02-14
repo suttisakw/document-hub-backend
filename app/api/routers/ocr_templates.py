@@ -10,7 +10,12 @@ from sqlmodel import Session, select
 from app.api.deps import get_current_user
 from app.db.session import get_session
 from app.models import Document, ExtractedField, OcrTemplate, OcrTemplateZone, User
-from app.schemas import OcrTemplateCreate, OcrTemplateResponse, OcrTemplateUpdate
+from app.schemas import (
+    ApplyTemplateResponse,
+    OcrTemplateCreate,
+    OcrTemplateResponse,
+    OcrTemplateUpdate,
+)
 
 router = APIRouter(prefix="/ocr/templates", tags=["ocr-templates"])
 
@@ -64,7 +69,12 @@ def _replace_zones(session: Session, template_id: UUID, zones: list) -> None:
         )
 
 
-@router.get("", response_model=list[OcrTemplateResponse])
+@router.get(
+    "",
+    response_model=list[OcrTemplateResponse],
+    summary="List templates",
+    description="All OCR templates for current user.",
+)
 def list_templates(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
@@ -77,7 +87,13 @@ def list_templates(
     return [_build_template_response(session, r) for r in rows]
 
 
-@router.post("", response_model=OcrTemplateResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=OcrTemplateResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create template",
+    description="Create OCR template with zones.",
+)
 def create_template(
     body: OcrTemplateCreate,
     session: Session = Depends(get_session),
@@ -102,7 +118,12 @@ def create_template(
     return _build_template_response(session, tpl)
 
 
-@router.get("/{template_id}", response_model=OcrTemplateResponse)
+@router.get(
+    "/{template_id}",
+    response_model=OcrTemplateResponse,
+    summary="Get template",
+    description="Single template with zones.",
+)
 def get_template(
     template_id: UUID,
     session: Session = Depends(get_session),
@@ -112,7 +133,12 @@ def get_template(
     return _build_template_response(session, tpl)
 
 
-@router.patch("/{template_id}", response_model=OcrTemplateResponse)
+@router.patch(
+    "/{template_id}",
+    response_model=OcrTemplateResponse,
+    summary="Update template",
+    description="Update name, doc_type, description, is_active, zones.",
+)
 def update_template(
     template_id: UUID,
     body: OcrTemplateUpdate,
@@ -147,7 +173,13 @@ def update_template(
     return _build_template_response(session, tpl)
 
 
-@router.delete("/{template_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+@router.delete(
+    "/{template_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    summary="Delete template",
+    description="Delete template and its zones.",
+)
 def delete_template(
     template_id: UUID,
     session: Session = Depends(get_session),
@@ -160,13 +192,18 @@ def delete_template(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/{template_id}/apply/{document_id}", response_model=dict)
+@router.post(
+    "/{template_id}/apply/{document_id}",
+    response_model=ApplyTemplateResponse,
+    summary="Apply template to document",
+    description="Map template zones to extracted fields; returns number applied.",
+)
 def apply_template_to_document(
     template_id: UUID,
     document_id: UUID,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
-) -> dict:
+) -> ApplyTemplateResponse:
     tpl = _template_or_404(session, current_user.id, template_id)
     doc = session.exec(
         select(Document).where(Document.id == document_id, Document.user_id == current_user.id)
@@ -180,7 +217,7 @@ def apply_template_to_document(
         .order_by(OcrTemplateZone.sort_order.asc())
     ).all()
     if not zones:
-        return {"applied": 0}
+        return ApplyTemplateResponse(applied=0)
 
     existing_fields = session.exec(
         select(ExtractedField).where(ExtractedField.document_id == doc.id)
@@ -250,7 +287,9 @@ def apply_template_to_document(
             session.add(existing_target)
         applied += 1
 
+    doc.applied_template_id = tpl.id
+    doc.applied_template_name = tpl.name
     doc.updated_at = now
     session.add(doc)
     session.commit()
-    return {"applied": applied}
+    return ApplyTemplateResponse(applied=applied)

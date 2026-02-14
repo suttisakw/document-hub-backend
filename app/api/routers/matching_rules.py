@@ -104,7 +104,12 @@ def _replace_nested(
             )
 
 
-@router.get("", response_model=list[MatchingRuleResponse])
+@router.get(
+    "",
+    response_model=list[MatchingRuleResponse],
+    summary="List rules",
+    description="All matching rules for current user.",
+)
 def list_rules(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
@@ -117,7 +122,13 @@ def list_rules(
     return [_build_rule_response(session, r) for r in rules]
 
 
-@router.post("", response_model=MatchingRuleResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=MatchingRuleResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create rule",
+    description="Create matching rule with conditions and fields.",
+)
 def create_rule(
     body: MatchingRuleCreate,
     session: Session = Depends(get_session),
@@ -148,7 +159,12 @@ def create_rule(
     return _build_rule_response(session, rule)
 
 
-@router.get("/{rule_id}", response_model=MatchingRuleResponse)
+@router.get(
+    "/{rule_id}",
+    response_model=MatchingRuleResponse,
+    summary="Get rule",
+    description="Single rule with conditions and fields.",
+)
 def get_rule(
     rule_id: UUID,
     session: Session = Depends(get_session),
@@ -158,7 +174,12 @@ def get_rule(
     return _build_rule_response(session, rule)
 
 
-@router.patch("/{rule_id}", response_model=MatchingRuleResponse)
+@router.patch(
+    "/{rule_id}",
+    response_model=MatchingRuleResponse,
+    summary="Update rule",
+    description="Update name, description, enabled, doc_types, conditions, fields.",
+)
 def update_rule(
     rule_id: UUID,
     body: MatchingRuleUpdate,
@@ -197,7 +218,13 @@ def update_rule(
     return _build_rule_response(session, rule)
 
 
-@router.delete("/{rule_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+@router.delete(
+    "/{rule_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    summary="Delete rule",
+    description="Delete rule and its conditions/fields.",
+)
 def delete_rule(
     rule_id: UUID,
     session: Session = Depends(get_session),
@@ -211,7 +238,12 @@ def delete_rule(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/{rule_id}/enable", response_model=MatchingRuleResponse)
+@router.post(
+    "/{rule_id}/enable",
+    response_model=MatchingRuleResponse,
+    summary="Enable rule",
+    description="Set rule enabled=true.",
+)
 def enable_rule(
     rule_id: UUID,
     session: Session = Depends(get_session),
@@ -226,7 +258,12 @@ def enable_rule(
     return _build_rule_response(session, rule)
 
 
-@router.post("/{rule_id}/disable", response_model=MatchingRuleResponse)
+@router.post(
+    "/{rule_id}/disable",
+    response_model=MatchingRuleResponse,
+    summary="Disable rule",
+    description="Set rule enabled=false.",
+)
 def disable_rule(
     rule_id: UUID,
     session: Session = Depends(get_session),
@@ -241,7 +278,12 @@ def disable_rule(
     return _build_rule_response(session, rule)
 
 
-@router.post("/{rule_id}/test", response_model=MatchingRuleTestResponse)
+@router.post(
+    "/{rule_id}/test",
+    response_model=MatchingRuleTestResponse,
+    summary="Test rule",
+    description="Evaluate rule on given document_ids; returns matches and counts.",
+)
 def test_rule(
     rule_id: UUID,
     body: MatchingRuleTestRequest,

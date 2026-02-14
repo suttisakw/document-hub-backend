@@ -21,6 +21,8 @@ from app.models import (
 )
 from app.schemas import (
     AddDocumentsToMatchSetRequest,
+    AutoMatchPairItem,
+    AutoMatchResponse,
     DocumentMatchSetCreate,
     DocumentMatchSetResponse,
     DocumentMatchSetUpdate,
@@ -72,7 +74,12 @@ def _doc_in_any_set(session: Session, document_id: UUID) -> bool:
     )
 
 
-@router.get("/sets", response_model=list[DocumentMatchSetResponse])
+@router.get(
+    "/sets",
+    response_model=list[DocumentMatchSetResponse],
+    summary="List match sets",
+    description="All match sets for current user.",
+)
 def list_sets(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
@@ -85,7 +92,13 @@ def list_sets(
     return [_build_set_response(session, item) for item in items]
 
 
-@router.post("/sets", response_model=DocumentMatchSetResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/sets",
+    response_model=DocumentMatchSetResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create match set",
+    description="Create a new match set (manual).",
+)
 def create_set(
     body: DocumentMatchSetCreate,
     session: Session = Depends(get_session),
@@ -106,7 +119,12 @@ def create_set(
     return _build_set_response(session, item)
 
 
-@router.get("/sets/{set_id}", response_model=DocumentMatchSetResponse)
+@router.get(
+    "/sets/{set_id}",
+    response_model=DocumentMatchSetResponse,
+    summary="Get match set",
+    description="Single set with documents.",
+)
 def get_set(
     set_id: UUID,
     session: Session = Depends(get_session),
@@ -116,7 +134,12 @@ def get_set(
     return _build_set_response(session, item)
 
 
-@router.patch("/sets/{set_id}", response_model=DocumentMatchSetResponse)
+@router.patch(
+    "/sets/{set_id}",
+    response_model=DocumentMatchSetResponse,
+    summary="Update match set",
+    description="Update name, status.",
+)
 def update_set(
     set_id: UUID,
     body: DocumentMatchSetUpdate,
@@ -139,7 +162,13 @@ def update_set(
     return _build_set_response(session, item)
 
 
-@router.delete("/sets/{set_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+@router.delete(
+    "/sets/{set_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    summary="Delete match set",
+    description="Delete set and its document links.",
+)
 def delete_set(
     set_id: UUID,
     session: Session = Depends(get_session),
@@ -152,7 +181,12 @@ def delete_set(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/sets/{set_id}/documents", response_model=DocumentMatchSetResponse)
+@router.post(
+    "/sets/{set_id}/documents",
+    response_model=DocumentMatchSetResponse,
+    summary="Add documents to set",
+    description="Add documents to match set; document must not be in another set.",
+)
 def add_documents_to_set(
     set_id: UUID,
     body: AddDocumentsToMatchSetRequest,
@@ -200,6 +234,8 @@ def add_documents_to_set(
     "/sets/{set_id}/documents/{document_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
+    summary="Remove document from set",
+    description="Remove document from match set.",
 )
 def remove_document_from_set(
     set_id: UUID,
@@ -224,7 +260,12 @@ def remove_document_from_set(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.get("/unmatched", response_model=list[MatchSetDocumentResponse])
+@router.get(
+    "/unmatched",
+    response_model=list[MatchSetDocumentResponse],
+    summary="List unmatched documents",
+    description="Documents not in any match set.",
+)
 def list_unmatched(
     limit: int = 200,
     offset: int = 0,
@@ -244,18 +285,23 @@ def list_unmatched(
     return [MatchSetDocumentResponse.model_validate(d, from_attributes=True) for d in docs]
 
 
-@router.post("/auto-match", response_model=dict)
+@router.post(
+    "/auto-match",
+    response_model=AutoMatchResponse,
+    summary="Auto-match documents",
+    description="Apply enabled rules to unmatched documents; create sets for pairs.",
+)
 def auto_match(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
-) -> dict:
+) -> AutoMatchResponse:
     rules = session.exec(
         select(MatchingRule)
         .where(MatchingRule.user_id == current_user.id, MatchingRule.enabled.is_(True))
         .order_by(MatchingRule.updated_at.desc())
     ).all()
     if not rules:
-        return {"created_sets": 0, "matched_pairs": []}
+        return AutoMatchResponse(created_sets=0, matched_pairs=[])
 
     linked_doc_ids = session.exec(select(DocumentMatchSetLink.document_id)).all()
     doc_stmt = select(Document).where(Document.user_id == current_user.id)
@@ -263,7 +309,7 @@ def auto_match(
         doc_stmt = doc_stmt.where(Document.id.notin_(linked_doc_ids))
     docs = session.exec(doc_stmt.order_by(Document.created_at.asc())).all()
     if len(docs) < 2:
-        return {"created_sets": 0, "matched_pairs": []}
+        return AutoMatchResponse(created_sets=0, matched_pairs=[])
 
     fields = session.exec(
         select(ExtractedField).where(ExtractedField.document_id.in_([d.id for d in docs]))
@@ -274,7 +320,7 @@ def auto_match(
 
     consumed_docs: set[UUID] = set()
     created_sets = 0
-    matched_pairs: list[dict] = []
+    matched_pairs: list[AutoMatchPairItem] = []
     now = datetime.utcnow()
 
     for rule in rules:
@@ -335,12 +381,12 @@ def auto_match(
                 consumed_docs.add(right.id)
                 created_sets += 1
                 matched_pairs.append(
-                    {
-                        "set_id": set_item.id,
-                        "rule_id": rule.id,
-                        "left_document_id": left.id,
-                        "right_document_id": right.id,
-                    }
+                    AutoMatchPairItem(
+                        set_id=set_item.id,
+                        rule_id=rule.id,
+                        left_document_id=left.id,
+                        right_document_id=right.id,
+                    )
                 )
 
-    return {"created_sets": created_sets, "matched_pairs": matched_pairs}
+    return AutoMatchResponse(created_sets=created_sets, matched_pairs=matched_pairs)

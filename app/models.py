@@ -22,6 +22,12 @@ class User(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
     documents: List["Document"] = Relationship(back_populates="user")
+    corrections_made: List["FieldCorrectionRecord"] = Relationship(
+        back_populates="corrected_by"
+    )
+    correction_audits: List["DocumentCorrectionAudit"] = Relationship(
+        back_populates="corrected_by"
+    )
 
 
 class Document(SQLModel, table=True):
@@ -43,10 +49,46 @@ class Document(SQLModel, table=True):
     scanned_at: datetime | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+    applied_template_id: UUID | None = Field(default=None, foreign_key="ocr_templates.id", index=True)
+    applied_template_name: str | None = Field(default=None)
+    has_corrections: bool = Field(default=False, index=True)
+    correction_status: str = Field(default="pending")
+    
+    # New unified extraction fields
+    full_text: str | None = Field(default=None)
+    embedding: list[float] | None = Field(default=None, sa_column=Column(JSON))
+    extracted_tables: dict | None = Field(default=None, sa_column=Column(JSON))
+    extraction_report: dict | None = Field(default=None, sa_column=Column(JSON))
+    confidence_report: dict | None = Field(default=None, sa_column=Column(JSON))
+    validation_report: dict | None = Field(default=None, sa_column=Column(JSON))
+    review_reason: str | None = Field(default=None)
+    
+    # Deep Intelligence fields (Phase 3)
+    ai_summary: str | None = Field(default=None)
+    ai_insight: dict | None = Field(default=None, sa_column=Column(JSON))
 
     user: "User" = Relationship(back_populates="documents")
-    pages_list: List["DocumentPage"] = Relationship(back_populates="document")
-    extracted_fields: List["ExtractedField"] = Relationship(back_populates="document")
+    pages_list: List["DocumentPage"] = Relationship(
+        back_populates="document",
+        sa_relationship_kwargs={
+            "cascade": "all, delete-orphan",
+            "passive_deletes": True,
+        },
+    )
+    extracted_fields: List["ExtractedField"] = Relationship(
+        back_populates="document",
+        sa_relationship_kwargs={
+            "cascade": "all, delete-orphan",
+            "passive_deletes": True,
+        },
+    )
+    correction_audits: List["DocumentCorrectionAudit"] = Relationship(
+        back_populates="document",
+        sa_relationship_kwargs={
+            "cascade": "all, delete-orphan",
+            "passive_deletes": True,
+        },
+    )
 
 
 class DocumentPage(SQLModel, table=True):
@@ -79,11 +121,20 @@ class ExtractedField(SQLModel, table=True):
     bbox_width: float | None = None
     bbox_height: float | None = None
     is_edited: bool = False
+    is_corrected: bool = Field(default=False)
+    correction_version: int | None = Field(default=None)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
     document: "Document" = Relationship(back_populates="extracted_fields")
     page: Optional["DocumentPage"] = Relationship(back_populates="extracted_fields")
+    corrections: List["FieldCorrectionRecord"] = Relationship(
+        back_populates="extracted_field",
+        sa_relationship_kwargs={
+            "cascade": "all, delete-orphan",
+            "passive_deletes": True,
+        },
+    )
 
 
 class OcrJob(SQLModel, table=True):
@@ -103,6 +154,9 @@ class OcrJob(SQLModel, table=True):
 
     requested_at: datetime = Field(default_factory=datetime.utcnow)
     completed_at: datetime | None = None
+    retry_count: int = Field(default=0)
+    current_step: str = Field(default="orchestrate", index=True) # orchestrate, render, ocr, extract
+    result_data: dict | None = Field(default=None, sa_column=Column(JSON))
     error_message: str | None = None
     result_json: dict | None = Field(default=None, sa_column=Column(JSON))
 
@@ -289,3 +343,167 @@ class OcrTemplateZone(SQLModel, table=True):
     sort_order: int = 0
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class FieldCorrectionRecord(SQLModel, table=True):
+    """Database table for individual field corrections."""
+
+    __tablename__ = "field_corrections"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True, index=True)
+    extracted_field_id: UUID = Field(
+        foreign_key="extracted_fields.id",
+        index=True,
+        description="Links to the field that was corrected"
+    )
+    corrected_by_user_id: UUID | None = Field(
+        foreign_key="users.id",
+        description="User who made the correction"
+    )
+    original_value: str | None = Field(
+        default=None,
+        description="Original extracted value"
+    )
+    corrected_value: str | None = Field(
+        default=None,
+        description="Corrected value"
+    )
+    correction_type: str = Field(
+        default="value_change",
+        description="Type of correction (value_change, value_cleared, etc.)"
+    )
+    correction_reason: str = Field(
+        default="other",
+        description="Why the correction was made"
+    )
+    reason_details: str | None = Field(
+        default=None,
+        description="Extended explanation or context"
+    )
+    confidence_adjustment: float | None = Field(
+        default=None,
+        description="Adjustment to confidence score"
+    )
+    corrected_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        index=True,
+        description="When the correction was made"
+    )
+    created_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        description="When record was created"
+    )
+    updated_at: datetime = Field(
+        default_factory=datetime.utcnow
+    )
+    feedback_sentiment: str | None = Field(
+        default=None,
+        description="User sentiment about extraction quality"
+    )
+    feedback_comment: str | None = Field(
+        default=None,
+        description="User feedback for training"
+    )
+    is_critical: bool = Field(
+        default=False,
+        description="Whether this correction affects compliance"
+    )
+    is_verified: bool = Field(
+        default=False,
+        description="Whether correction was verified by second user"
+    )
+
+    extracted_field: "ExtractedField" = Relationship(
+        back_populates="corrections"
+    )
+    corrected_by: Optional["User"] = Relationship(
+        back_populates="corrections_made"
+    )
+
+
+class DocumentCorrectionAudit(SQLModel, table=True):
+    """
+    Audit record for document-level corrections.
+    
+    Tracks when documents are corrected, by whom, and provides
+    summary statistics for analytical queries.
+    """
+
+    __tablename__ = "document_correction_audits"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True, index=True)
+    document_id: UUID = Field(
+        foreign_key="documents.id",
+        index=True,
+        description="Document that was corrected"
+    )
+    corrected_by_user_id: UUID | None = Field(
+        foreign_key="users.id",
+        description="User who initiated corrections"
+    )
+    total_fields_corrected: int = Field(
+        default=0,
+        description="Number of fields corrected in this session"
+    )
+    total_corrections: int = Field(
+        default=0,
+        description="Total correction records created"
+    )
+    corrections_by_reason: str | None = Field(
+        default=None,
+        description="JSON dict of correction counts by reason"
+    )
+    has_critical_corrections: bool = Field(
+        default=False,
+        description="Whether any corrections are marked critical"
+    )
+    critical_correction_count: int = Field(
+        default=0
+    )
+    feedback_provided_count: int = Field(
+        default=0,
+        description="Number of corrections with training feedback"
+    )
+    correction_started_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        description="When correction session started"
+    )
+    correction_completed_at: datetime | None = Field(
+        default=None,
+        description="When correction session was completed"
+    )
+    created_at: datetime = Field(
+        default_factory=datetime.utcnow
+    )
+    session_notes: str | None = Field(
+        default=None,
+        description="Notes about the correction session"
+    )
+
+    document: "Document" = Relationship(
+        back_populates="correction_audits"
+    )
+    corrected_by: Optional["User"] = Relationship(
+        back_populates="correction_audits"
+    )
+
+class SystemConfig(SQLModel, table=True):
+    """Configuration settings for the extraction engine."""
+    __tablename__ = "system_configs"
+    key: str = Field(primary_key=True, index=True)
+    value: str = Field(description="JSON serialized value")
+    category: str = Field(default="general", index=True)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class DocumentTypeDefinition(SQLModel, table=True):
+    """Defines a document type and its extraction schema."""
+    __tablename__ = "document_type_definitions"
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    name: str = Field(index=True, unique=True)
+    display_name: str
+    description: Optional[str] = None
+    fields_schema: str = Field(description="JSON list of field names to extract")
+    validation_rules: str | None = Field(default=None, description="JSON Schema for validation")
+    active: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+

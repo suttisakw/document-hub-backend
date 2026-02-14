@@ -4,85 +4,53 @@ import json
 import re
 from typing import Any
 
-import requests
+import json
+import re
+from typing import Any
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "qwen2.5:7b"
-REQUEST_TIMEOUT = (5, 120)
+import os
+from app.providers.llm.base import LlmProvider, LlmResult
+from app.providers.llm.ollama_provider import OllamaProvider
+from app.providers.llm.openai_provider import OpenAiProvider
 
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
-def _prompt(text: str) -> str:
-    return (
-        "Extract structured invoice data from the text below.\n"
-        "Return JSON only.\n\n"
-        "Fields:\n"
+def get_llm_provider() -> LlmProvider:
+    """Get the configured LLM provider based on environment variables."""
+    if OPENAI_API_KEY:
+        return OpenAiProvider(api_key=OPENAI_API_KEY, model_name=OPENAI_MODEL)
+    return OllamaProvider(url=OLLAMA_URL, model_name=OLLAMA_MODEL)
+
+async def extract_invoice_fields(text: str) -> dict[str, Any]:
+    """
+    Extract invoice fields using the configured LLM provider.
+    """
+    schema = (
         "* invoice_number\n"
         "* date\n"
         "* vendor\n"
-        "* total_amount\n\n"
-        "TEXT:\n"
-        f"{text}"
+        "* total_amount"
     )
-
-
-def _extract_json_object(text: str) -> dict[str, Any] | None:
-    text = text.strip()
-    if not text:
-        return None
-
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-
-    match = re.search(r"\{[\s\S]*\}", text)
-    if not match:
-        return None
-    try:
-        parsed = json.loads(match.group(0))
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        return None
-    return None
-
-
-def extract_invoice_fields(text: str) -> dict[str, Any]:
-    payload = {
-        "model": MODEL_NAME,
-        "prompt": _prompt(text),
-        "stream": False,
-    }
-
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json=payload,
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
+    provider = get_llm_provider()
+    result = await provider.extract_fields(text, schema)
+    
+    # Ensure backward compatibility of returned keys if needed
+    data = result.data
+    if "_error" in data:
         return {
             "invoice_number": None,
             "date": None,
             "vendor": None,
             "total_amount": None,
-            "_error": f"ollama_request_failed: {exc}",
+            "_error": data["_error"]
         }
+    
+    return data
 
-    body: dict[str, Any] = response.json() if response.content else {}
-    model_text = str(body.get("response", "")).strip()
-
-    parsed = _extract_json_object(model_text)
-    if parsed is not None:
-        return parsed
-
-    return {
-        "invoice_number": None,
-        "date": None,
-        "vendor": None,
-        "total_amount": None,
-        "_raw": model_text,
-    }
+async def extract_fields_custom(text: str, schema: str) -> LlmResult:
+    """Extract fields with custom schema."""
+    provider = get_llm_provider()
+    return await provider.extract_fields(text, schema)

@@ -7,26 +7,38 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from sqlalchemy import delete, false
 from sqlmodel import Session, select
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_admin
 from app.core.config import settings
 from app.db.session import get_session
 from app.models import (
     Document,
-    DocumentPage,
     ExternalOcrInterface,
     ExtractedField,
     OcrJob,
     User,
 )
 from app.schemas import (
+    OcrDlqItemResponse,
+    OcrDlqPurgeResponse,
+    OcrDlqRequeueResponse,
     OcrJobResponse,
+    OcrJobResultResponse,
     OcrJobWithDocumentResponse,
+    OcrQueueStatsResponse,
+    OcrRequeueLogItemResponse,
     OcrTriggerExternalRequest,
 )
-from app.services.ocr_easyocr import run_easyocr_on_image_bytes
 from app.services.ocr_external import trigger_external_ocr
-from app.services.pdf_render import render_pdf_to_png_pages
-from app.services.storage import resolve_storage_path, save_bytes
+from app.services.ocr_queue import enqueue_easyocr_job
+from app.services.redis_queue import (
+    append_easyocr_ops_log,
+    get_easyocr_queue_stats,
+    list_easyocr_dlq,
+    list_easyocr_ops_log,
+    purge_easyocr_dlq,
+    remove_easyocr_dlq_job,
+    requeue_easyocr_dlq_job,
+)
 
 router = APIRouter(prefix="/ocr", tags=["ocr"])
 
@@ -148,7 +160,12 @@ def _apply_external_structured_result(
     session.add(doc)
 
 
-@router.get("/jobs", response_model=list[OcrJobWithDocumentResponse])
+@router.get(
+    "/jobs",
+    response_model=list[OcrJobWithDocumentResponse],
+    summary="List OCR jobs",
+    description="Filter by provider, status, document_id; paginated.",
+)
 def list_jobs(
     provider: str | None = None,
     status: str | None = None,
@@ -193,7 +210,12 @@ def list_jobs(
     return out
 
 
-@router.get("/jobs/queue", response_model=list[OcrJobWithDocumentResponse])
+@router.get(
+    "/jobs/queue",
+    response_model=list[OcrJobWithDocumentResponse],
+    summary="List queue jobs",
+    description="Active jobs only: status triggered or running.",
+)
 def list_job_queue(
     limit: int = 100,
     session: Session = Depends(get_session),
@@ -231,7 +253,12 @@ def list_job_queue(
     return out
 
 
-@router.get("/jobs/history", response_model=list[OcrJobWithDocumentResponse])
+@router.get(
+    "/jobs/history",
+    response_model=list[OcrJobWithDocumentResponse],
+    summary="List job history",
+    description="Terminal jobs: completed, error, cancelled.",
+)
 def list_job_history(
     provider: str | None = None,
     document_id: UUID | None = None,
@@ -278,7 +305,171 @@ def list_job_history(
     return out
 
 
-@router.post("/jobs/{job_id}/retry", response_model=OcrJobResponse)
+@router.get(
+    "/ops/queue/stats",
+    response_model=OcrQueueStatsResponse,
+    summary="Queue stats (admin)",
+    description="Queue depth, delayed, DLQ depth. Admin only.",
+)
+def get_queue_stats(
+    _: User = Depends(require_admin),
+) -> OcrQueueStatsResponse:
+    stats = get_easyocr_queue_stats()
+    return OcrQueueStatsResponse(
+        queue_depth=stats.get("queue_depth", 0),
+        processing_depth=stats.get("processing_depth", 0),
+        delayed_depth=stats.get("delayed_depth", 0),
+        dlq_depth=stats.get("dlq_depth", 0),
+    )
+
+
+@router.get(
+    "/ops/dlq",
+    response_model=list[OcrDlqItemResponse],
+    summary="List DLQ (admin)",
+    description="Dead-letter queue items. Admin only.",
+)
+def list_dlq(
+    limit: int = 50,
+    _: User = Depends(require_admin),
+) -> list[OcrDlqItemResponse]:
+    items = list_easyocr_dlq(limit=max(1, min(limit, 200)))
+    out: list[OcrDlqItemResponse] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        job_id = str(item.get("job_id") or "")
+        payload = {k: v for k, v in item.items() if k != "job_id"}
+        out.append(OcrDlqItemResponse(job_id=job_id, payload=payload))
+    return out
+
+
+@router.post(
+    "/ops/dlq/requeue/{job_id}",
+    response_model=OcrDlqRequeueResponse,
+    summary="Requeue DLQ job (admin)",
+    description="Move job from DLQ back to queue. Admin only.",
+)
+def requeue_dlq_job(
+    job_id: UUID,
+    admin_user: User = Depends(require_admin),
+) -> OcrDlqRequeueResponse:
+    ok = requeue_easyocr_dlq_job(job_id=str(job_id))
+    if not ok:
+        return OcrDlqRequeueResponse(
+            ok=False,
+            message="Job not found in DLQ",
+            job_id=str(job_id),
+        )
+
+    append_easyocr_ops_log(
+        payload={
+            "job_id": str(job_id),
+            "action": "requeue",
+            "at": datetime.now(UTC).isoformat(),
+            "actor_user_id": str(admin_user.id),
+            "actor_email": admin_user.email,
+        }
+    )
+
+    return OcrDlqRequeueResponse(
+        ok=True,
+        message="Job requeued",
+        job_id=str(job_id),
+    )
+
+
+@router.delete(
+    "/ops/dlq/{job_id}",
+    response_model=OcrDlqPurgeResponse,
+    summary="Purge one DLQ job (admin)",
+    description="Remove job from DLQ. Admin only.",
+)
+def purge_dlq_job(
+    job_id: UUID,
+    admin_user: User = Depends(require_admin),
+) -> OcrDlqPurgeResponse:
+    removed = 1 if remove_easyocr_dlq_job(job_id=str(job_id)) else 0
+    if removed:
+        append_easyocr_ops_log(
+            payload={
+                "job_id": str(job_id),
+                "action": "purge",
+                "at": datetime.now(UTC).isoformat(),
+                "actor_user_id": str(admin_user.id),
+                "actor_email": admin_user.email,
+            }
+        )
+    return OcrDlqPurgeResponse(
+        ok=removed > 0,
+        message="Removed" if removed > 0 else "Job not found in DLQ",
+        removed=removed,
+        job_id=str(job_id),
+    )
+
+
+@router.delete(
+    "/ops/dlq",
+    response_model=OcrDlqPurgeResponse,
+    summary="Purge all DLQ (admin)",
+    description="Clear entire DLQ. Admin only.",
+)
+def purge_all_dlq(
+    admin_user: User = Depends(require_admin),
+) -> OcrDlqPurgeResponse:
+    removed = purge_easyocr_dlq()
+    append_easyocr_ops_log(
+        payload={
+            "job_id": "*",
+            "action": "purge_all",
+            "at": datetime.now(UTC).isoformat(),
+            "actor_user_id": str(admin_user.id),
+            "actor_email": admin_user.email,
+            "removed": removed,
+        }
+    )
+    return OcrDlqPurgeResponse(
+        ok=True,
+        message="DLQ purged",
+        removed=removed,
+    )
+
+
+@router.get(
+    "/ops/requeue-history",
+    response_model=list[OcrRequeueLogItemResponse],
+    summary="Requeue history (admin)",
+    description="Log of requeue/purge actions. Admin only.",
+)
+def get_ops_history(
+    limit: int = 50,
+    _: User = Depends(require_admin),
+) -> list[OcrRequeueLogItemResponse]:
+    rows = list_easyocr_ops_log(limit=max(1, min(limit, 200)))
+    out: list[OcrRequeueLogItemResponse] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        out.append(
+            OcrRequeueLogItemResponse(
+                job_id=str(row.get("job_id") or ""),
+                action=str(row.get("action") or "unknown"),
+                at=str(row.get("at") or ""),
+                actor_user_id=str(row.get("actor_user_id"))
+                if row.get("actor_user_id")
+                else None,
+                actor_email=str(row.get("actor_email")) if row.get("actor_email") else None,
+            )
+        )
+    return out
+
+
+@router.post(
+    "/jobs/{job_id}/retry",
+    response_model=OcrJobResponse,
+    summary="Retry failed job",
+    description="Only jobs with status 'error' can be retried.",
+)
 async def retry_job(
     job_id: UUID,
     request: Request,
@@ -297,11 +488,7 @@ async def retry_job(
         raise HTTPException(status_code=400, detail="Only failed jobs can be retried")
 
     if old_job.provider == "easyocr":
-        return run_easyocr(
-            document_id=doc.id,
-            session=session,
-            current_user=current_user,
-        )
+        return enqueue_easyocr_job(session=session, document_id=doc.id)
 
     if old_job.provider == "external":
         interface_uuid = old_job.interface_id
@@ -335,7 +522,12 @@ async def retry_job(
     raise HTTPException(status_code=400, detail="Unsupported OCR provider")
 
 
-@router.post("/jobs/{job_id}/cancel", response_model=OcrJobResponse)
+@router.post(
+    "/jobs/{job_id}/cancel",
+    response_model=OcrJobResponse,
+    summary="Cancel job",
+    description="Cancel active job (pending/triggered/running).",
+)
 def cancel_job(
     job_id: UUID,
     session: Session = Depends(get_session),
@@ -376,12 +568,17 @@ def cancel_job(
     return job
 
 
-@router.get("/jobs/{job_id}/result", response_model=dict)
+@router.get(
+    "/jobs/{job_id}/result",
+    response_model=OcrJobResultResponse,
+    summary="Get job result",
+    description="Normalized result envelope including result_json from provider.",
+)
 def get_job_result(
     job_id: UUID,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
-) -> dict:
+) -> OcrJobResultResponse:
     job = session.exec(select(OcrJob).where(OcrJob.id == job_id)).first()
     if job is None:
         raise HTTPException(status_code=404, detail="OCR job not found")
@@ -390,19 +587,24 @@ def get_job_result(
     if doc is None or doc.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="OCR job not found")
 
-    return {
-        "job_id": str(job.id),
-        "document_id": str(job.document_id),
-        "provider": job.provider,
-        "status": job.status,
-        "requested_at": job.requested_at,
-        "completed_at": job.completed_at,
-        "error_message": job.error_message,
-        "result_json": job.result_json,
-    }
+    return OcrJobResultResponse(
+        job_id=str(job.id),
+        document_id=str(job.document_id),
+        provider=job.provider,
+        status=job.status,
+        requested_at=job.requested_at,
+        completed_at=job.completed_at,
+        error_message=job.error_message,
+        result_json=job.result_json,
+    )
 
 
-@router.get("/jobs/{document_id}", response_model=list[OcrJobResponse])
+@router.get(
+    "/jobs/{document_id}",
+    response_model=list[OcrJobResponse],
+    summary="List jobs for document",
+    description="All OCR jobs for a single document.",
+)
 def list_document_jobs(
     document_id: UUID,
     session: Session = Depends(get_session),
@@ -424,7 +626,12 @@ def list_document_jobs(
     return list(jobs)
 
 
-@router.get("/job/{job_id}", response_model=OcrJobResponse)
+@router.get(
+    "/job/{job_id}",
+    response_model=OcrJobResponse,
+    summary="Get job by ID",
+    description="Single OCR job details.",
+)
 def get_job(
     job_id: UUID,
     session: Session = Depends(get_session),
@@ -442,7 +649,12 @@ def get_job(
     return job
 
 
-@router.post("/trigger/external/{document_id}", response_model=OcrJobResponse)
+@router.post(
+    "/trigger/external/{document_id}",
+    response_model=OcrJobResponse,
+    summary="Trigger external OCR",
+    description="Send document to external OCR interface; returns job.",
+)
 async def trigger_external(
     document_id: UUID,
     body: OcrTriggerExternalRequest,
@@ -553,7 +765,12 @@ async def trigger_external(
     return job
 
 
-@router.post("/run/easyocr/{document_id}", response_model=OcrJobResponse)
+@router.post(
+    "/run/easyocr/{document_id}",
+    response_model=OcrJobResponse,
+    summary="Run EasyOCR",
+    description="Enqueue EasyOCR job for document; returns existing job if already queued.",
+)
 def run_easyocr(
     document_id: UUID,
     session: Session = Depends(get_session),
@@ -567,118 +784,29 @@ def run_easyocr(
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    path = resolve_storage_path(settings.storage_dir, doc.file_path)
-    try:
-        file_bytes = path.read_bytes()
-    except OSError as e:
-        raise HTTPException(status_code=500, detail="Failed to read stored file") from e
+    active_job = session.exec(
+        select(OcrJob)
+        .where(
+            OcrJob.document_id == doc.id,
+            OcrJob.provider == "easyocr",
+            OcrJob.status.in_(["pending", "running"]),
+        )
+        .order_by(OcrJob.requested_at.desc())
+        .limit(1)
+    ).first()
+    if active_job is not None:
+        return active_job
 
-    job = OcrJob(
-        document_id=doc.id,
-        provider="easyocr",
-        status="running",
-        requested_at=datetime.utcnow(),
-    )
-    session.add(job)
-    doc.status = "processing"
-    doc.updated_at = datetime.utcnow()
-    session.add(doc)
-    session.commit()
-    session.refresh(job)
-
-    extracted_count = 0
-    try:
-        if (
-            doc.mime_type or ""
-        ).lower() == "application/pdf" or path.name.lower().endswith(".pdf"):
-            rendered = render_pdf_to_png_pages(file_bytes)
-            doc.pages = len(rendered)
-            session.add(doc)
-            session.commit()
-
-            for page in rendered:
-                rel = f"pages/{doc.id}/{page.page_number}.png"
-                save_bytes(settings.storage_dir, rel, page.png_bytes)
-                session.add(
-                    DocumentPage(
-                        document_id=doc.id,
-                        page_number=page.page_number,
-                        image_path=rel,
-                        width=page.width,
-                        height=page.height,
-                        created_at=datetime.utcnow(),
-                    )
-                )
-
-                fields = run_easyocr_on_image_bytes(page.png_bytes)
-                for f in fields:
-                    session.add(
-                        ExtractedField(
-                            document_id=doc.id,
-                            page_id=None,
-                            page_number=page.page_number,
-                            field_name=f.field_name,
-                            field_value=f.field_value,
-                            confidence=f.confidence,
-                            bbox_x=f.bbox_x,
-                            bbox_y=f.bbox_y,
-                            bbox_width=f.bbox_width,
-                            bbox_height=f.bbox_height,
-                            is_edited=False,
-                            created_at=datetime.utcnow(),
-                            updated_at=datetime.utcnow(),
-                        )
-                    )
-                    extracted_count += 1
-        else:
-            fields = run_easyocr_on_image_bytes(file_bytes)
-            for f in fields:
-                session.add(
-                    ExtractedField(
-                        document_id=doc.id,
-                        page_id=None,
-                        page_number=1,
-                        field_name=f.field_name,
-                        field_value=f.field_value,
-                        confidence=f.confidence,
-                        bbox_x=f.bbox_x,
-                        bbox_y=f.bbox_y,
-                        bbox_width=f.bbox_width,
-                        bbox_height=f.bbox_height,
-                        is_edited=False,
-                        created_at=datetime.utcnow(),
-                        updated_at=datetime.utcnow(),
-                    )
-                )
-                extracted_count += 1
-    except Exception as e:
-        job.status = "error"
-        job.error_message = str(e)
-        session.add(job)
-        session.commit()
-        raise HTTPException(
-            status_code=400,
-            detail="EasyOCR failed (unsupported file or OCR error)",
-        ) from e
-
-    job.status = "completed"
-    job.completed_at = datetime.utcnow()
-    session.add(job)
-
-    doc.status = "scanned" if extracted_count > 0 else "error"
-    doc.scanned_at = datetime.utcnow()
-    doc.updated_at = datetime.utcnow()
-    session.add(doc)
-
-    session.commit()
-    session.refresh(job)
-    return job
+    return enqueue_easyocr_job(session=session, document_id=doc.id)
 
 
 @router.post(
     "/webhook/external",
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
+    summary="External OCR webhook",
+    description="Callback for external OCR; validate X-OCR-Secret; apply result to job.",
+    include_in_schema=True,
 )
 def external_webhook(
     payload: dict,

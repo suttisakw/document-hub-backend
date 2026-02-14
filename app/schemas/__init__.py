@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 UserRole = Literal["admin", "editor", "viewer"]
 
@@ -25,6 +25,17 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     password: str
+
+
+class UserUpdate(BaseModel):
+    """Update current user profile (name only)."""
+
+    name: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
 
 
 class UserResponse(UserBase):
@@ -54,8 +65,8 @@ class DocumentExportRequest(BaseModel):
 
 
 class DocumentResponse(DocumentBase):
-    id: str
-    user_id: str
+    id: UUID
+    user_id: UUID
     status: str
     file_path: str
     file_size: int
@@ -63,6 +74,14 @@ class DocumentResponse(DocumentBase):
     pages: int
     confidence: float | None = None
     created_at: datetime
+    applied_template_id: UUID | None = None
+    applied_template_name: str | None = None
+    extraction_report: dict | None = None
+    confidence_report: dict | None = None
+    validation_report: dict | None = None
+    extracted_tables: dict | None = None
+    ai_summary: str | None = None
+    ai_insight: dict | None = None
 
     model_config = {"from_attributes": True}
 
@@ -74,9 +93,55 @@ class DocumentListResponse(BaseModel):
     offset: int
 
 
-class ExtractedFieldResponse(BaseModel):
-    id: str
+class DocumentStatsResponse(BaseModel):
+    """Aggregate document counts by status and type."""
+
+    total: int
+    by_status: dict[str, int] = Field(default_factory=dict)
+    by_type: dict[str, int] = Field(default_factory=dict)
+
+
+class DocumentStatsWeeklyItem(BaseModel):
+    date: str
+    count: int
+
+
+class OcrJobResultResponse(BaseModel):
+    """Normalized OCR job result envelope."""
+
+    job_id: str
     document_id: str
+    provider: str
+    status: str
+    requested_at: datetime
+    completed_at: datetime | None = None
+    error_message: str | None = None
+    result_json: dict | None = None
+
+
+class ApplyTemplateResponse(BaseModel):
+    applied: int
+
+
+class OkResponse(BaseModel):
+    ok: bool = True
+
+
+class AutoMatchPairItem(BaseModel):
+    set_id: UUID
+    rule_id: UUID
+    left_document_id: UUID
+    right_document_id: UUID
+
+
+class AutoMatchResponse(BaseModel):
+    created_sets: int = 0
+    matched_pairs: list[AutoMatchPairItem] = []
+
+
+class ExtractedFieldResponse(BaseModel):
+    id: UUID
+    document_id: UUID
     page_number: int | None = None
     field_name: str
     field_value: str | None = None
@@ -92,7 +157,7 @@ class ExtractedFieldResponse(BaseModel):
 
 
 class DocumentPageResponse(BaseModel):
-    id: str
+    id: UUID
     page_number: int
     width: int | None = None
     height: int | None = None
@@ -179,8 +244,58 @@ class ExternalOcrInterfaceResponse(BaseModel):
         )
 
 
+class StorageStatusResponse(BaseModel):
+    provider: str
+    healthy: bool
+    message: str | None = None
+    details: dict = Field(default_factory=dict)
+
+
+class StorageConnectionTestResponse(BaseModel):
+    provider: str
+    ok: bool
+    message: str | None = None
+
+
+class OcrQueueStatsResponse(BaseModel):
+    queue_depth: int
+    processing_depth: int
+    delayed_depth: int
+    dlq_depth: int
+
+
+class OcrDlqItemResponse(BaseModel):
+    job_id: str
+    payload: dict = Field(default_factory=dict)
+
+
+class OcrDlqRequeueResponse(BaseModel):
+    ok: bool
+    message: str
+    job_id: str
+
+
+class OcrDlqPurgeResponse(BaseModel):
+    ok: bool
+    message: str
+    removed: int
+    job_id: str | None = None
+
+
+class OcrRequeueLogItemResponse(BaseModel):
+    job_id: str
+    action: str
+    at: str
+    actor_user_id: str | None = None
+    actor_email: str | None = None
+
+
 class ExtractedFieldUpdate(BaseModel):
     field_value: str | None
+
+
+class DocumentTablesUpdate(BaseModel):
+    extracted_tables: dict
 
 
 class AdminUserCreate(BaseModel):
@@ -471,3 +586,114 @@ class OcrTemplateResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     zones: list[OcrTemplateZoneResponse] = []
+
+
+# Export unified document schemas
+from app.schemas.unified_document import (  # noqa: E402
+    BoundingBox,
+    DocumentPage as UnifiedDocumentPage,
+    ExtractedTable,
+    ExtractedValue,
+    ExtractionSource,
+    TableCell,
+    TableRow,
+    UnifiedDocument,
+    UnifiedDocumentCreate,
+    UnifiedDocumentResponse,
+    create_table_from_rows,
+    extract_value_from_field,
+)
+
+__all__ = [
+    # User schemas
+    "Token",
+    "TokenData",
+    "UserBase",
+    "UserCreate",
+    "UserUpdate",
+    "ChangePasswordRequest",
+    "UserResponse",
+    "UserRole",
+    # Document schemas
+    "DocumentBase",
+    "DocumentCreate",
+    "DocumentUpdate",
+    "DocumentExportRequest",
+    "DocumentResponse",
+    "DocumentListResponse",
+    "DocumentStatsResponse",
+    "DocumentStatsWeeklyItem",
+    "DocumentDetailResponse",
+    "DocumentPageResponse",
+    # OCR schemas
+    "OcrJobResultResponse",
+    "OcrJobResponse",
+    "OcrJobWithDocumentResponse",
+    "OcrTriggerExternalRequest",
+    "ExtractedFieldResponse",
+    "ExtractedFieldUpdate",
+    # External OCR
+    "ExternalOcrInterfaceCreate",
+    "ExternalOcrInterfaceUpdate",
+    "ExternalOcrInterfaceResponse",
+    # Storage
+    "StorageStatusResponse",
+    "StorageConnectionTestResponse",
+    # OCR Queue
+    "OcrQueueStatsResponse",
+    "OcrDlqItemResponse",
+    "OcrDlqRequeueResponse",
+    "OcrDlqPurgeResponse",
+    "OcrRequeueLogItemResponse",
+    # Admin
+    "AdminUserCreate",
+    "AdminUserUpdate",
+    # Common responses
+    "OkResponse",
+    "ApplyTemplateResponse",
+    "AutoMatchPairItem",
+    "AutoMatchResponse",
+    # Categories, Tags, Groups
+    "DocumentCategoryCreate",
+    "DocumentCategoryUpdate",
+    "DocumentCategoryResponse",
+    "TagCreate",
+    "TagUpdate",
+    "TagResponse",
+    "DocumentGroupCreate",
+    "DocumentGroupUpdate",
+    "DocumentGroupResponse",
+    "DocumentGroupWithDocumentsResponse",
+    # Matching
+    "DocumentMatchSetCreate",
+    "DocumentMatchSetUpdate",
+    "DocumentMatchSetResponse",
+    "DocumentMatchSetDetailResponse",
+    "MatchingRuleCreate",
+    "MatchingRuleUpdate",
+    "MatchingRuleResponse",
+    "MatchingRuleDetailResponse",
+    "MatchingRuleConditionInput",
+    "MatchingRuleFieldInput",
+    "MatchingPreviewRequest",
+    "MatchingPreviewResponse",
+    # Templates
+    "OcrTemplateCreate",
+    "OcrTemplateUpdate",
+    "OcrTemplateZoneInput",
+    "OcrTemplateZoneResponse",
+    "OcrTemplateResponse",
+    # Unified Document Schemas (NEW)
+    "UnifiedDocument",
+    "UnifiedDocumentCreate",
+    "UnifiedDocumentResponse",
+    "ExtractedValue",
+    "ExtractedTable",
+    "TableRow",
+    "TableCell",
+    "BoundingBox",
+    "ExtractionSource",
+    "UnifiedDocumentPage",
+    "extract_value_from_field",
+    "create_table_from_rows",
+]

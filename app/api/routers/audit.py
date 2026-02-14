@@ -14,7 +14,12 @@ from app.schemas import AuditLogResponse
 router = APIRouter(prefix="/audit", tags=["audit"])
 
 
-@router.get("/logs", response_model=list[AuditLogResponse])
+@router.get(
+    "/logs",
+    response_model=list[AuditLogResponse],
+    summary="List audit logs",
+    description="Filter by action, entity_type, document_id, actor, date range. Admin can filter by actor.",
+)
 def list_audit_logs(
     action: str | None = None,
     entity_type: str | None = None,
@@ -26,7 +31,7 @@ def list_audit_logs(
     offset: int = 0,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
-) -> list[AuditLog]:
+) -> list[AuditLogResponse]:
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
 

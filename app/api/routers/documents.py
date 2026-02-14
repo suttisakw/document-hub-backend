@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import os
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
+from pathlib import PurePosixPath
+from typing import List
 from uuid import UUID
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -16,12 +17,11 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy import delete, func
 from sqlmodel import Session, select
 
 from app.api.deps import get_current_user
-from app.core.config import settings
 from app.db.session import get_session
 from app.models import Document, DocumentPage, ExtractedField, User
 from app.schemas import (
@@ -30,18 +30,31 @@ from app.schemas import (
     DocumentListResponse,
     DocumentPageResponse,
     DocumentResponse,
+    DocumentStatsResponse,
+    DocumentStatsWeeklyItem,
     DocumentUpdate,
+    DocumentTablesUpdate,
     ExtractedFieldResponse,
     ExtractedFieldUpdate,
 )
 from app.services.audit import write_audit_log
 from app.services.pdf_render import render_pdf_to_png_pages
-from app.services.storage import resolve_storage_path, save_bytes, save_document_file
+from app.services.storage import (
+    StorageError,
+    get_storage,
+    storage_http_exception,
+)
+from app.services.document_service import DocumentService
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 
-@router.get("/", response_model=DocumentListResponse)
+@router.get(
+    "/",
+    response_model=DocumentListResponse,
+    summary="List documents",
+    description="Paginated list with filters: q, status, type, date range, confidence, sort.",
+)
 def list_documents(
     q: str | None = None,
     status: str | None = None,
@@ -60,14 +73,6 @@ def list_documents(
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
 
-    conditions = [Document.user_id == current_user.id]
-    if status:
-        conditions.append(Document.status == status)
-    if type:
-        conditions.append(Document.type == type)
-    if q:
-        conditions.append(Document.name.ilike(f"%{q}%"))
-
     def _parse_dt(value: str, *, end_of_day: bool) -> datetime | None:
         try:
             if len(value) == 10:
@@ -77,48 +82,76 @@ def list_documents(
         except ValueError:
             return None
 
-    if created_from:
-        dt = _parse_dt(created_from, end_of_day=False)
-        if dt is not None:
-            conditions.append(Document.created_at >= dt)
-    if created_to:
-        dt = _parse_dt(created_to, end_of_day=True)
-        if dt is not None:
-            conditions.append(Document.created_at <= dt)
-    if confidence_min is not None:
-        conditions.append(Document.confidence >= confidence_min)
-    if confidence_max is not None:
-        conditions.append(Document.confidence <= confidence_max)
+    dt_from = _parse_dt(created_from, end_of_day=False) if created_from else None
+    dt_to = _parse_dt(created_to, end_of_day=True) if created_to else None
 
-    base_stmt = select(Document).where(*conditions)
-    total = session.exec(select(func.count()).select_from(Document).where(*conditions)).one()
+    service = DocumentService(session)
+    docs, total = service.list_documents(
+        user_id=current_user.id,
+        limit=limit,
+        offset=offset,
+        q=q,
+        status=status,
+        type=type,
+        created_from=dt_from,
+        created_to=dt_to
+    )
 
-    sort_map = {
-        "created_at": Document.created_at,
-        "updated_at": Document.updated_at,
-        "name": Document.name,
-        "confidence": Document.confidence,
-    }
-    order_col = sort_map.get((sort_by or "created_at").lower(), Document.created_at)
-    if (sort_order or "desc").lower() == "asc":
-        base_stmt = base_stmt.order_by(order_col.asc())
-    else:
-        base_stmt = base_stmt.order_by(order_col.desc())
-
-    docs = session.exec(base_stmt.offset(offset).limit(limit)).all()
     return DocumentListResponse(
-        items=list(docs),
-        total=int(total or 0),
+        items=[DocumentResponse.model_validate(d, from_attributes=True) for d in docs],
+        total=total,
         limit=limit,
         offset=offset,
     )
 
 
-@router.get("/stats", response_model=dict)
+@router.get("/search", response_model=DocumentListResponse)
+async def search_documents(
+    q: str,
+    limit: int = 50,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Perform advanced full-text search across document contents."""
+    service = DocumentService(session)
+    results = service.search_advanced(current_user.id, q, limit)
+    return DocumentListResponse(items=results, total=len(results), limit=limit, offset=0)
+
+
+@router.get("/{document_id}/similar", response_model=List[DocumentResponse])
+async def get_similar_documents(
+    document_id: UUID,
+    limit: int = 5,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Discover documents similar to the given one (by type/vendor)."""
+    service = DocumentService(session)
+    return service.get_similar_documents(document_id, current_user.id, limit)
+
+
+@router.get("/{document_id}/summary")
+async def get_document_summary(
+    document_id: UUID,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Generate and return an AI-powered summary of the document."""
+    service = DocumentService(session)
+    summary = await service.generate_summary(document_id, current_user.id)
+    return {"summary": summary}
+
+
+@router.get(
+    "/stats",
+    response_model=DocumentStatsResponse,
+    summary="Document statistics",
+    description="Aggregate counts by status and type for current user's documents.",
+)
 def document_stats(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
-) -> dict:
+) -> DocumentStatsResponse:
     docs = session.exec(select(Document).where(Document.user_id == current_user.id)).all()
     by_status: dict[str, int] = {}
     by_type: dict[str, int] = {}
@@ -126,19 +159,24 @@ def document_stats(
         by_status[d.status] = by_status.get(d.status, 0) + 1
         by_type[d.type] = by_type.get(d.type, 0) + 1
 
-    return {
-        "total": len(docs),
-        "by_status": by_status,
-        "by_type": by_type,
-    }
+    return DocumentStatsResponse(
+        total=len(docs),
+        by_status=by_status,
+        by_type=by_type,
+    )
 
 
-@router.get("/stats/weekly", response_model=list[dict])
+@router.get(
+    "/stats/weekly",
+    response_model=list[DocumentStatsWeeklyItem],
+    summary="Weekly document counts",
+    description="Daily document counts for the last N days (1–60).",
+)
 def document_stats_weekly(
     days: int = 7,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
-) -> list[dict]:
+) -> list[DocumentStatsWeeklyItem]:
     days = max(1, min(days, 60))
     start_date = datetime.utcnow().date() - timedelta(days=days - 1)
 
@@ -153,15 +191,20 @@ def document_stats_weekly(
         key = d.created_at.date().isoformat()
         counts[key] = counts.get(key, 0) + 1
 
-    out: list[dict] = []
+    out: list[DocumentStatsWeeklyItem] = []
     for i in range(days):
         day = start_date + timedelta(days=i)
         key = day.isoformat()
-        out.append({"date": key, "count": counts.get(key, 0)})
+        out.append(DocumentStatsWeeklyItem(date=key, count=counts.get(key, 0)))
     return out
 
 
-@router.get("/recent", response_model=list[DocumentResponse])
+@router.get(
+    "/recent",
+    response_model=list[DocumentResponse],
+    summary="Recent documents",
+    description="Latest documents for current user (limit 1–100).",
+)
 def recent_documents(
     limit: int = 10,
     session: Session = Depends(get_session),
@@ -177,7 +220,13 @@ def recent_documents(
     return list(docs)
 
 
-@router.post("/", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=DocumentResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload document",
+    description="Upload a file (PDF/image). Creates document and stores file.",
+)
 def create_document(
     request: Request,
     type: str = Form(...),
@@ -186,23 +235,23 @@ def create_document(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> Document:
-    if file.filename is None:
-        raise HTTPException(status_code=400, detail="Missing filename")
-
-    doc = Document(
-        user_id=current_user.id,
-        name=name or file.filename,
-        type=type,
-        status="pending",
-        file_path="",
-        file_size=0,
-        mime_type=file.content_type,
-        pages=1,
-        confidence=None,
-        scanned_at=None,
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow(),
-    )
+    service = DocumentService(session)
+    doc = service.create_document(current_user.id, file, doc_type=type)
+    
+    if name:
+        doc.name = name
+    
+    # Image preview logic
+    if (doc.mime_type or "").startswith("image/"):
+        session.add(
+            DocumentPage(
+                document_id=doc.id,
+                page_number=1,
+                image_path=doc.file_path,
+                created_at=datetime.utcnow(),
+            )
+        )
+    
     session.add(doc)
     session.commit()
     session.refresh(doc)
@@ -219,37 +268,15 @@ def create_document(
     )
     session.commit()
 
-    file_path = save_document_file(settings.storage_dir, doc.id, file)
-    try:
-        size = os.path.getsize(resolve_storage_path(settings.storage_dir, file_path))
-    except OSError:
-        size = 0
-
-    doc.file_path = file_path
-    doc.file_size = size
-    doc.updated_at = datetime.utcnow()
-    session.add(doc)
-
-    # If the upload is an image, use it as page 1 preview
-    if (doc.mime_type or "").startswith("image/"):
-        session.add(
-            DocumentPage(
-                document_id=doc.id,
-                page_number=1,
-                image_path=doc.file_path,
-                width=None,
-                height=None,
-                created_at=datetime.utcnow(),
-            )
-        )
-
-    session.commit()
-    session.refresh(doc)
-
     return doc
 
 
-@router.post("/export")
+@router.post(
+    "/export",
+    summary="Export documents as ZIP",
+    description="Returns a ZIP of requested documents. Headers: X-Requested-Count, X-Exported-Count.",
+    responses={200: {"description": "ZIP stream"}},
+)
 def export_documents_zip(
     body: DocumentExportRequest,
     session: Session = Depends(get_session),
@@ -258,42 +285,10 @@ def export_documents_zip(
     doc_ids = list(dict.fromkeys(body.document_ids))
     if not doc_ids:
         raise HTTPException(status_code=400, detail="document_ids is required")
-    if len(doc_ids) > 500:
-        raise HTTPException(status_code=400, detail="Maximum 500 documents per export")
 
-    docs = session.exec(
-        select(Document).where(Document.user_id == current_user.id, Document.id.in_(doc_ids))
-    ).all()
-    if not docs:
-        raise HTTPException(status_code=404, detail="No documents found")
+    service = DocumentService(session)
+    buffer, filename, requested_count, exported_count = service.export_documents_zip(doc_ids, current_user.id)
 
-    requested_count = len(doc_ids)
-    exported_count = 0
-    buffer = BytesIO()
-    with ZipFile(buffer, mode="w", compression=ZIP_DEFLATED) as zipf:
-        for doc in docs:
-            try:
-                path = resolve_storage_path(settings.storage_dir, doc.file_path)
-            except OSError:
-                continue
-            if not path.exists() or not path.is_file():
-                continue
-
-            ext = path.suffix if path.suffix else ""
-            safe_name = (doc.name or str(doc.id)).strip() or str(doc.id)
-            safe_name = safe_name.replace("/", "_").replace("\\", "_")
-            arc_name = f"{doc.id}_{safe_name}{ext}"
-            try:
-                zipf.write(path, arcname=arc_name)
-                exported_count += 1
-            except OSError:
-                continue
-
-    if buffer.getbuffer().nbytes == 0:
-        raise HTTPException(status_code=404, detail="No readable files for selected documents")
-
-    buffer.seek(0)
-    filename = f"document-export-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.zip"
     return StreamingResponse(
         buffer,
         media_type="application/zip",
@@ -305,37 +300,24 @@ def export_documents_zip(
     )
 
 
-@router.get("/{document_id}", response_model=DocumentDetailResponse)
+@router.get(
+    "/{document_id}",
+    response_model=DocumentDetailResponse,
+    summary="Get document detail",
+    description="Document with extracted fields and page images.",
+)
 def get_document(
     document_id: UUID,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> DocumentDetailResponse:
-    doc = session.exec(
-        select(Document).where(
-            Document.id == document_id,
-            Document.user_id == current_user.id,
-        )
-    ).first()
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    fields = session.exec(
-        select(ExtractedField)
-        .where(ExtractedField.document_id == doc.id)
-        .order_by(ExtractedField.page_number.asc(), ExtractedField.created_at.asc())
-    ).all()
-    # Attach for response model
-    pages = session.exec(
-        select(DocumentPage)
-        .where(DocumentPage.document_id == doc.id)
-        .order_by(DocumentPage.page_number.asc())
-    ).all()
+    service = DocumentService(session)
+    doc, fields, pages = service.get_document_with_details(document_id, current_user.id)
 
     # Build response
     return DocumentDetailResponse(
-        id=str(doc.id),
-        user_id=str(doc.user_id),
+        id=doc.id,
+        user_id=doc.user_id,
         name=doc.name,
         type=doc.type,
         status=doc.status,
@@ -355,7 +337,12 @@ def get_document(
     )
 
 
-@router.patch("/{document_id}/fields/{field_id}", response_model=ExtractedFieldResponse)
+@router.patch(
+    "/{document_id}/fields/{field_id}",
+    response_model=ExtractedFieldResponse,
+    summary="Update extracted field",
+    description="Update field value and mark as edited.",
+)
 def update_extracted_field(
     document_id: UUID,
     field_id: UUID,
@@ -408,7 +395,12 @@ def update_extracted_field(
     return ExtractedFieldResponse.model_validate(field, from_attributes=True)
 
 
-@router.get("/{document_id}/pages", response_model=list[DocumentPageResponse])
+@router.get(
+    "/{document_id}/pages",
+    response_model=list[DocumentPageResponse],
+    summary="List document pages",
+    description="Rendered page images metadata for the document.",
+)
 def list_pages(
     document_id: UUID,
     session: Session = Depends(get_session),
@@ -430,136 +422,70 @@ def list_pages(
     return [DocumentPageResponse.model_validate(p, from_attributes=True) for p in pages]
 
 
-@router.post("/{document_id}/render", response_model=list[DocumentPageResponse])
+@router.post(
+    "/{document_id}/render",
+    response_model=list[DocumentPageResponse],
+    summary="Re-render PDF pages",
+    description="Forces re-rendering of PDF pages to PNG images.",
+)
 def render_pdf_pages(
     document_id: UUID,
     request: Request,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> list[DocumentPageResponse]:
-    doc = session.exec(
-        select(Document).where(
-            Document.id == document_id, Document.user_id == current_user.id
-        )
-    ).first()
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    path = resolve_storage_path(settings.storage_dir, doc.file_path)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-
-    if (
-        doc.mime_type or ""
-    ).lower() != "application/pdf" and not path.name.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Not a PDF")
-
-    try:
-        pdf_bytes = path.read_bytes()
-    except OSError as e:
-        raise HTTPException(status_code=500, detail="Failed to read stored file") from e
-
-    rendered = render_pdf_to_png_pages(pdf_bytes)
-
-    # Replace existing page images for this document
-    session.exec(delete(DocumentPage).where(DocumentPage.document_id == doc.id))
-
-    pages: list[DocumentPage] = []
-    for page in rendered:
-        rel = f"pages/{doc.id}/{page.page_number}.png"
-        save_bytes(settings.storage_dir, rel, page.png_bytes)
-        p = DocumentPage(
-            document_id=doc.id,
-            page_number=page.page_number,
-            image_path=rel,
-            width=page.width,
-            height=page.height,
-            created_at=datetime.utcnow(),
-        )
-        session.add(p)
-        pages.append(p)
-
-    doc.pages = len(rendered)
-    doc.updated_at = datetime.utcnow()
-    session.add(doc)
-    session.commit()
+    service = DocumentService(session)
+    pages = service.render_pages(document_id, current_user.id)
 
     write_audit_log(
         session=session,
         actor=current_user,
         action="document.render_pages",
         entity_type="document",
-        entity_id=doc.id,
-        document_id=doc.id,
+        entity_id=document_id,
+        document_id=document_id,
         request=request,
-        meta={"pages": doc.pages},
+        meta={"pages": len(pages)},
     )
     session.commit()
 
-    # Refresh pages ids
-    out = session.exec(
-        select(DocumentPage)
-        .where(DocumentPage.document_id == doc.id)
-        .order_by(DocumentPage.page_number.asc())
-    ).all()
-    return [DocumentPageResponse.model_validate(p, from_attributes=True) for p in out]
+    return [DocumentPageResponse.model_validate(p, from_attributes=True) for p in pages]
 
 
-@router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete document",
+    description="Delete document and stored file.",
+)
 def delete_document(
     document_id: UUID,
     request: Request,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    doc = session.exec(
-        select(Document).where(
-            Document.id == document_id, Document.user_id == current_user.id
-        )
-    ).first()
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    # Note: file cleanup is best-effort; DB delete is primary.
-    try:
-        path = resolve_storage_path(settings.storage_dir, doc.file_path)
-        if path.exists():
-            path.unlink()
-    except OSError:
-        pass
-
-    # Cleanup rendered pages (if any)
-    try:
-        pages_dir = resolve_storage_path(settings.storage_dir, f"pages/{doc.id}")
-        if pages_dir.exists() and pages_dir.is_dir():
-            for p in pages_dir.glob("*"):
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
-            try:
-                pages_dir.rmdir()
-            except OSError:
-                pass
-    except OSError:
-        pass
+    service = DocumentService(session)
+    doc_meta = service.delete_document(document_id, current_user.id)
 
     write_audit_log(
         session=session,
         actor=current_user,
         action="document.delete",
         entity_type="document",
-        entity_id=doc.id,
-        document_id=doc.id,
+        entity_id=document_id,
+        document_id=document_id,
         request=request,
-        meta={"name": doc.name, "type": doc.type, "status": doc.status},
+        meta=doc_meta,
     )
-
-    session.delete(doc)
     session.commit()
 
 
-@router.patch("/{document_id}", response_model=DocumentResponse)
+@router.patch(
+    "/{document_id}",
+    response_model=DocumentResponse,
+    summary="Update document",
+    description="Update name and/or type.",
+)
 def update_document(
     document_id: UUID,
     patch: DocumentUpdate,
@@ -607,53 +533,72 @@ def update_document(
     return doc
 
 
-@router.get("/{document_id}/file")
-def get_document_file(
+@router.patch("/{document_id}/tables", response_model=DocumentResponse)
+async def update_document_tables(
     document_id: UUID,
+    patch: DocumentTablesUpdate,
+    request: Request,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
+    """Update extracted table data (manual corrections)."""
     doc = session.exec(
         select(Document).where(
             Document.id == document_id, Document.user_id == current_user.id
         )
     ).first()
-    if doc is None:
+    if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    path = resolve_storage_path(settings.storage_dir, doc.file_path)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
+    old_tables = doc.extracted_tables
+    doc.extracted_tables = patch.extracted_tables
+    doc.updated_at = datetime.utcnow()
+    doc.has_corrections = True
+    
+    session.add(doc)
+    
+    write_audit_log(
+        session=session,
+        actor=current_user,
+        action="document.update_tables",
+        entity_type="document",
+        entity_id=doc.id,
+        document_id=doc.id,
+        request=request,
+        meta={"tables": {"from": old_tables, "to": doc.extracted_tables}},
+    )
+    
+    session.commit()
+    session.refresh(doc)
+    return doc
 
-    return FileResponse(path=path, media_type=doc.mime_type or None, filename=doc.name)
+
+@router.get(
+    "/{document_id}/file",
+    summary="Download document file",
+    description="Streams the stored file (PDF/image).",
+    responses={200: {"description": "File stream"}},
+)
+def get_document_file(
+    document_id: UUID,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    service = DocumentService(session)
+    return service.get_file_response(document_id, current_user.id)
 
 
-@router.get("/{document_id}/pages/{page_number}/image")
+@router.get(
+    "/{document_id}/pages/{page_number}/image",
+    summary="Get page image",
+    description="Image for a single rendered page (e.g. PNG).",
+    responses={200: {"description": "Image stream"}},
+)
 def get_page_image(
     document_id: UUID,
     page_number: int,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    doc = session.exec(
-        select(Document).where(
-            Document.id == document_id, Document.user_id == current_user.id
-        )
-    ).first()
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    page = session.exec(
-        select(DocumentPage).where(
-            DocumentPage.document_id == doc.id,
-            DocumentPage.page_number == page_number,
-        )
-    ).first()
-    if page is None or not page.image_path:
-        raise HTTPException(status_code=404, detail="Page image not found")
-
-    path = resolve_storage_path(settings.storage_dir, page.image_path)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Page image file not found")
-
-    return FileResponse(path=path, media_type="image/png")
+    service = DocumentService(session)
+    return service.get_page_image(document_id, page_number, current_user.id)

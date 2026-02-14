@@ -13,12 +13,74 @@ from app.schemas import (
     ExternalOcrInterfaceCreate,
     ExternalOcrInterfaceResponse,
     ExternalOcrInterfaceUpdate,
+    StorageConnectionTestResponse,
+    StorageStatusResponse,
+)
+from app.services.storage import (
+    StorageConfigurationError,
+    StorageError,
+    get_storage,
 )
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
 
-@router.get("/external-ocr", response_model=list[ExternalOcrInterfaceResponse])
+@router.get(
+    "/storage",
+    response_model=StorageStatusResponse,
+    summary="Storage status",
+    description="Current storage provider and health.",
+)
+def get_storage_status(
+    current_user: User = Depends(get_current_user),
+) -> StorageStatusResponse:
+    _ = current_user
+    try:
+        storage = get_storage()
+        healthy, message = storage.healthcheck(perform_write=False)
+        return StorageStatusResponse(
+            provider=storage.provider,
+            healthy=healthy,
+            message=message,
+            details=storage.describe(),
+        )
+    except StorageConfigurationError as e:
+        return StorageStatusResponse(
+            provider="unknown",
+            healthy=False,
+            message=str(e),
+            details={},
+        )
+
+
+@router.post(
+    "/storage/test",
+    response_model=StorageConnectionTestResponse,
+    summary="Test storage connection",
+    description="Healthcheck with write test.",
+)
+def test_storage_connection(
+    current_user: User = Depends(get_current_user),
+) -> StorageConnectionTestResponse:
+    _ = current_user
+    try:
+        storage = get_storage()
+        ok, message = storage.healthcheck(perform_write=True)
+        return StorageConnectionTestResponse(
+            provider=storage.provider,
+            ok=ok,
+            message=message,
+        )
+    except (StorageConfigurationError, StorageError) as e:
+        return StorageConnectionTestResponse(provider="unknown", ok=False, message=str(e))
+
+
+@router.get(
+    "/external-ocr",
+    response_model=list[ExternalOcrInterfaceResponse],
+    summary="List external OCR interfaces",
+    description="User's external OCR interface configs.",
+)
 def list_external_ocr_interfaces(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
@@ -36,6 +98,8 @@ def list_external_ocr_interfaces(
     "/external-ocr",
     response_model=ExternalOcrInterfaceResponse,
     status_code=status.HTTP_201_CREATED,
+    summary="Create external OCR interface",
+    description="Register a new external OCR interface.",
 )
 def create_external_ocr_interface(
     body: ExternalOcrInterfaceCreate,
@@ -84,7 +148,10 @@ def create_external_ocr_interface(
 
 
 @router.patch(
-    "/external-ocr/{interface_id}", response_model=ExternalOcrInterfaceResponse
+    "/external-ocr/{interface_id}",
+    response_model=ExternalOcrInterfaceResponse,
+    summary="Update external OCR interface",
+    description="Update name, URL, enabled, is_default, secrets.",
 )
 def update_external_ocr_interface(
     interface_id: UUID,
@@ -151,6 +218,8 @@ def update_external_ocr_interface(
     "/external-ocr/{interface_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
+    summary="Delete external OCR interface",
+    description="Remove interface config.",
 )
 def delete_external_ocr_interface(
     interface_id: UUID,

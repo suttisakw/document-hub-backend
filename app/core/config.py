@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 30
 
     # Local file storage (dev default). In production prefer S3.
+    storage_provider: str = "local"
     storage_dir: str = "./storage"
 
     # AWS S3
@@ -23,9 +24,16 @@ class Settings(BaseSettings):
     aws_secret_access_key: str = ""
     aws_default_region: str = "us-east-1"
     s3_bucket_name: str = "document-hub-files"
+    s3_prefix: str = ""
 
     # Redis
     redis_url: str = "redis://localhost:6379"
+    redis_key_prefix: str = "document-hub"
+    ocr_claim_lock_ttl_seconds: int = 30
+    ocr_queue_block_timeout_seconds: int = 2
+    ocr_queue_max_attempts: int = 3
+    ocr_queue_retry_base_seconds: int = 5
+    ocr_queue_retry_max_seconds: int = 60
 
     # OCR
     ocr_engine: str = "easyocr"

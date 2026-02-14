@@ -37,7 +37,12 @@ from app.schemas import (
 router = APIRouter(prefix="/taxonomy", tags=["taxonomy"])
 
 
-@router.get("/categories", response_model=list[CategoryResponse])
+@router.get(
+    "/categories",
+    response_model=list[CategoryResponse],
+    summary="List categories",
+    description="All categories for current user.",
+)
 def list_categories(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
@@ -50,7 +55,12 @@ def list_categories(
     return list(items)
 
 
-@router.get("/categories/stats", response_model=list[CategoryStatsResponse])
+@router.get(
+    "/categories/stats",
+    response_model=list[CategoryStatsResponse],
+    summary="Category stats",
+    description="Categories with document counts.",
+)
 def category_stats(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
@@ -86,6 +96,8 @@ def category_stats(
     "/categories",
     response_model=CategoryResponse,
     status_code=status.HTTP_201_CREATED,
+    summary="Create category",
+    description="Create document category.",
 )
 def create_category(
     body: CategoryCreate,
@@ -118,7 +130,12 @@ def create_category(
     return item
 
 
-@router.patch("/categories/{category_id}", response_model=CategoryResponse)
+@router.patch(
+    "/categories/{category_id}",
+    response_model=CategoryResponse,
+    summary="Update category",
+    description="Update name, description, color, is_active.",
+)
 def update_category(
     category_id: UUID,
     body: CategoryUpdate,
@@ -160,6 +177,8 @@ def update_category(
     "/categories/{category_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
+    summary="Delete category",
+    description="Delete category and unset from documents.",
 )
 def delete_category(
     category_id: UUID,
@@ -191,7 +210,12 @@ def delete_category(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.patch("/documents/{document_id}/category", response_model=dict)
+@router.patch(
+    "/documents/{document_id}/category",
+    response_model=dict,
+    summary="Set document category",
+    description="Set or clear category for document.",
+)
 def set_document_category(
     document_id: UUID,
     body: SetCategoryRequest,
@@ -229,7 +253,12 @@ def set_document_category(
     return {"ok": True}
 
 
-@router.get("/tags", response_model=list[TagResponse])
+@router.get(
+    "/tags",
+    response_model=list[TagResponse],
+    summary="List tags",
+    description="All tags for current user.",
+)
 def list_tags(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
@@ -242,7 +271,12 @@ def list_tags(
     return list(items)
 
 
-@router.get("/tags/stats", response_model=list[TagStatsResponse])
+@router.get(
+    "/tags/stats",
+    response_model=list[TagStatsResponse],
+    summary="Tag stats",
+    description="Tags with document counts.",
+)
 def tag_stats(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
@@ -275,7 +309,13 @@ def tag_stats(
     return out
 
 
-@router.post("/tags", response_model=TagResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/tags",
+    response_model=TagResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create tag",
+    description="Create tag.",
+)
 def create_tag(
     body: TagCreate,
     session: Session = Depends(get_session),
@@ -301,7 +341,12 @@ def create_tag(
     return item
 
 
-@router.patch("/tags/{tag_id}", response_model=TagResponse)
+@router.patch(
+    "/tags/{tag_id}",
+    response_model=TagResponse,
+    summary="Update tag",
+    description="Update name, color.",
+)
 def update_tag(
     tag_id: UUID,
     body: TagUpdate,
@@ -331,7 +376,11 @@ def update_tag(
 
 
 @router.delete(
-    "/tags/{tag_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response
+    "/tags/{tag_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    summary="Delete tag",
+    description="Delete tag and its document links.",
 )
 def delete_tag(
     tag_id: UUID,
@@ -354,7 +403,12 @@ def delete_tag(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.get("/documents/{document_id}/tags", response_model=list[TagResponse])
+@router.get(
+    "/documents/{document_id}/tags",
+    response_model=list[TagResponse],
+    summary="Get document tags",
+    description="Tags assigned to document.",
+)
 def get_document_tags(
     document_id: UUID,
     session: Session = Depends(get_session),
@@ -380,7 +434,12 @@ def get_document_tags(
     return list(tags)
 
 
-@router.put("/documents/{document_id}/tags", response_model=dict)
+@router.put(
+    "/documents/{document_id}/tags",
+    response_model=dict,
+    summary="Set document tags",
+    description="Replace tags for document.",
+)
 def set_document_tags(
     document_id: UUID,
     body: SetTagsRequest,
@@ -418,7 +477,12 @@ def set_document_tags(
     return {"ok": True}
 
 
-@router.get("/groups", response_model=list[DocumentGroupResponse])
+@router.get(
+    "/groups",
+    response_model=list[DocumentGroupResponse],
+    summary="List groups",
+    description="All document groups for current user.",
+)
 def list_groups(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
@@ -432,7 +496,11 @@ def list_groups(
 
 
 @router.post(
-    "/groups", response_model=DocumentGroupResponse, status_code=status.HTTP_201_CREATED
+    "/groups",
+    response_model=DocumentGroupResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create group",
+    description="Create document group.",
 )
 def create_group(
     body: DocumentGroupCreate,
@@ -462,7 +530,12 @@ def create_group(
     return item
 
 
-@router.patch("/groups/{group_id}", response_model=DocumentGroupResponse)
+@router.patch(
+    "/groups/{group_id}",
+    response_model=DocumentGroupResponse,
+    summary="Update group",
+    description="Update name, description.",
+)
 def update_group(
     group_id: UUID,
     body: DocumentGroupUpdate,
@@ -498,6 +571,8 @@ def update_group(
     "/groups/{group_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
+    summary="Delete group",
+    description="Delete group and its document links.",
 )
 def delete_group(
     group_id: UUID,
@@ -523,7 +598,12 @@ def delete_group(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.get("/groups/{group_id}/documents", response_model=list[UUID])
+@router.get(
+    "/groups/{group_id}/documents",
+    response_model=list[UUID],
+    summary="Get group documents",
+    description="Document IDs in group.",
+)
 def get_group_documents(
     group_id: UUID,
     session: Session = Depends(get_session),
@@ -544,7 +624,12 @@ def get_group_documents(
     return [link.document_id for link in links]
 
 
-@router.put("/groups/{group_id}/documents", response_model=dict)
+@router.put(
+    "/groups/{group_id}/documents",
+    response_model=dict,
+    summary="Set group documents",
+    description="Replace documents in group.",
+)
 def set_group_documents(
     group_id: UUID,
     body: SetGroupDocumentsRequest,
